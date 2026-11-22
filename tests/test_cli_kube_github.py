@@ -205,3 +205,28 @@ def test_verified_comment_has_no_clickable_url():
     code, out = run_cli(["comment", "--pr", "8", "--sha", SHA, "--branch", "b", "--status", "verified"])
     assert code == 0
     assert "http://" not in out and "`pr-8-b.preview.localtest.me`" in out and "ephemeral" in out
+
+
+def test_cli_rejects_extra_network_policy_that_widens_ingress(tmp_path, capsys):
+    extra = tmp_path / "np.yaml"
+    extra.write_text(
+        "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: allow-all}\n"
+        "spec: {podSelector: {}, ingress: [{}]}\n",
+        encoding="utf-8",
+    )
+    code, _ = run_cli(["render", "--pr", "5", "--sha", SHA, "--extra", str(extra)])
+    assert code == 2 and "reserved-kind" in capsys.readouterr().err
+
+
+def test_cli_rejects_non_mapping_extra_documents(tmp_path):
+    extra = tmp_path / "list.yaml"
+    extra.write_text("- a\n- b\n", encoding="utf-8")
+    assert run_cli(["render", "--pr", "5", "--sha", SHA, "--extra", str(extra)])[0] == 1
+
+
+def test_open_pull_requests_refuses_truncated_list():
+    def opener(req, timeout):
+        return FakeResponse([{"number": 1}], '<https://api.github.com/next>; rel="next"')
+
+    with pytest.raises(ValueError, match="incomplete"):
+        open_pull_requests("o/r", "t", opener=opener, max_pages=3)
