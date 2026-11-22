@@ -80,20 +80,23 @@ check_host "$NS1" 101 "$SHA1"
 check_host "$NS2" 102 "$SHA2"
 
 step "network policy: other previews are blocked, same namespace is allowed"
-probe() {  # probe <namespace> <url> -> prints Succeeded or Failed
+# probe <namespace> <url> -> prints Succeeded or Failed. curl retries because the network
+# policy controller programs a new pod's IP a moment after the pod starts.
+probe() {
   local ns=$1 url=$2 name="probe-$RANDOM"
   local overrides
   overrides=$(jq -cn --arg url "$url" '{spec: {
     securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: "RuntimeDefault"}},
     containers: [{name: "probe", image: "curlimages/curl:8.11.1",
-      command: ["curl", "-fsS", "-m", "5", $url],
+      command: ["curl", "-fsS", "-m", "4", "--retry", "6", "--retry-delay", "2", "--retry-all-errors", $url],
       securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}')
   kubectl -n "$ns" run "$name" --restart=Never --image=curlimages/curl:8.11.1 --overrides="$overrides" >/dev/null
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 90); do
     phase=$(kubectl -n "$ns" get pod "$name" -o jsonpath='{.status.phase}')
     [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
     sleep 2
   done
+  kubectl -n "$ns" logs "$name" 2>&1 | tail -3 | sed "s/^/    [$ns] /" >&2
   kubectl -n "$ns" delete pod "$name" --wait=false >/dev/null
   echo "$phase"
 }
