@@ -1,0 +1,77 @@
+name: Preview environment
+
+# Builds the pull request, deploys it as a preview on a k3d cluster inside the
+# runner, smoke-tests it through the Ingress and posts a sticky status comment.
+#
+# The cluster lives only for the job, so this verifies that every PR *can* be
+# previewed. To keep previews running, point the deploy step at a persistent
+# cluster (self-hosted runner or a kubeconfig secret) and schedule `previewctl gc`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: Create cluster, build and import the image
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.8.3 bash
+          k3d cluster create preview --agents 0 -p "8081:80@loadbalancer" --wait --timeout 180s
+          docker build -q -t "preview-app:${SHA}" app
+          k3d image import -c preview "preview-app:${SHA}"
+          for _ in $(seq 1 60); do kubectl -n kube-system get deploy traefik >/dev/null 2>&1 && break; sleep 3; done
+          kubectl -n kube-system rollout status deploy/traefik --timeout=180s
+      - name: Deploy preview
+        run: previewctl deploy --pr "$PR" --branch "$BRANCH" --sha "$SHA" --config examples/preview.yaml
+      - name: Smoke test through the Ingress
+        id: smoke
+        run: |
+          NS=$(python -c "import os; from previewctl.naming import env_name; print(env_name(int(os.environ['PR']), os.environ['BRANCH']))")
+          for _ in $(seq 1 30); do
+            body=$(curl -fsS -m 5 -H "Host: ${NS}.preview.localtest.me" http://127.0.0.1:8081/version || true)
+            [ -n "$body" ] && break; sleep 2
+          done
+          echo "$body" | jq -e --arg sha "$SHA" '.sha == $sha'
+          {
+            echo 'details<<EOF'
+            echo '```json'
+            echo "$body" | jq .
+            echo '```'
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - name: Post status comment
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ job.status == 'success' && 'ready' || 'failed' }}
+          DETAILS: ${{ steps.smoke.outputs.details }}
+        run: |
+          previewctl comment --pr "$PR" --branch "$BRANCH" --sha "$SHA" --config examples/preview.yaml \
+            --status "$STATUS" --details "$DETAILS" > comment.md
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- previewctl -->")) | .id' | tail -1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F body=@comment.md >/dev/null
+          else
+            gh pr comment "$PR" --body-file comment.md
+          fi

@@ -1,0 +1,20 @@
+# Example preview configuration. Every key is optional; unknown keys are rejected.
+app: web
+image: preview-app            # repository only: the commit SHA is always the tag
+domain: preview.localtest.me  # *.localtest.me resolves to 127.0.0.1
+port: 8080
+replicas: 1
+ttl_hours: 48                 # refreshed on every push to the PR
+cpu_request: 50m
+cpu_limit: 250m
+memory_request: 64Mi
+memory_limit: 128Mi
+quota_cpu: "1"
+quota_memory: 512Mi
+quota_pods: 6
+ingress_class: traefik
+ingress_namespace: kube-system
+health_path: /healthz
+env:
+  LOG_LEVEL: debug
+  FEATURE_NEW_CHECKOUT: "true"
