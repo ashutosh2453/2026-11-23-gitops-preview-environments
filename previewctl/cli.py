@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("comment", help="Markdown body for the pull request status comment")
     _target_args(p)
-    p.add_argument("--status", choices=["ready", "failed", "deleted"], required=True)
+    p.add_argument("--status", choices=["ready", "verified", "failed", "deleted"], required=True)
     p.add_argument("--details", default="", help="extra Markdown, e.g. smoke-test output")
     return ap
 
@@ -166,7 +166,8 @@ def cmd_comment(args, cfg, out) -> int:
     target = PreviewTarget(pr=args.pr, sha=args.sha, branch=args.branch)
     ns = target.namespace
     expires = render(cfg, target)[0]["metadata"]["annotations"][ANN_EXPIRES]
-    icon = {"ready": "✅", "failed": "❌", "deleted": "🧹"}[args.status]
+    icon = {"ready": "✅", "verified": "✅", "failed": "❌", "deleted": "🧹"}[args.status]
+    host = host_for(ns, cfg.domain)
     lines = [
         "<!-- previewctl -->",
         f"### {icon} Preview environment: {args.status}",
@@ -174,10 +175,19 @@ def cmd_comment(args, cfg, out) -> int:
         "| | |",
         "|---|---|",
         f"| Namespace | `{ns}` |",
-        f"| URL | http://{host_for(ns, cfg.domain)}/ |",
-        f"| Commit | `{target.sha[:12]}` |",
-        f"| Expires | {expires} (refreshed on every push) |",
     ]
+    if args.status == "ready":
+        # Only a persistent cluster has a URL reviewers can open.
+        lines += [f"| URL | http://{host}/ |", f"| Expires | {expires} (refreshed on every push) |"]
+    else:
+        lines += [f"| Host | `{host}` |"]
+    lines += [f"| Commit | `{target.sha[:12]}` |"]
+    if args.status == "verified":
+        lines += [
+            "",
+            "Deployed and smoke-tested through the Ingress on an ephemeral k3d cluster in CI. "
+            "The cluster is deleted when the job ends, so there is no link to open.",
+        ]
     if args.details:
         lines += ["", args.details]
     print("\n".join(lines), file=out)

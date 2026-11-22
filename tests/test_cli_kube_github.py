@@ -199,3 +199,9 @@ def test_gc_uses_github_when_repo_given(monkeypatch):
     r = FakeRunner({"get namespaces": _ns_list()})
     code, out = run_cli(["gc", "--repo", "o/r"], monkeypatch, r)
     assert code == 0 and "DELETE  pr-1" in out and "keep    pr-2" in out
+
+
+def test_verified_comment_has_no_clickable_url():
+    code, out = run_cli(["comment", "--pr", "8", "--sha", SHA, "--branch", "b", "--status", "verified"])
+    assert code == 0
+    assert "http://" not in out and "`pr-8-b.preview.localtest.me`" in out and "ephemeral" in out
