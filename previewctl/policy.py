@@ -1,0 +1,118 @@
+"""Guardrails checked before anything is applied to the cluster.
+
+A preview runs code from an unreviewed pull request, so it must stay inside its own
+namespace and resource budget. These checks run on the rendered manifests plus any
+extra manifests a repository adds (``--extra``), so a PR cannot widen its own blast
+radius by adding, say, a ClusterRoleBinding or a hostPath volume.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+ALLOWED_KINDS = {
+    "Namespace",
+    "ResourceQuota",
+    "LimitRange",
+    "NetworkPolicy",
+    "Deployment",
+    "Service",
+    "Ingress",
+    "ConfigMap",
+    "Job",
+}
+WORKLOAD_KINDS = {"Deployment", "Job"}
+
+
+@dataclass(frozen=True)
+class Violation:
+    kind: str
+    name: str
+    rule: str
+    message: str
+
+    def __str__(self) -> str:
+        return f"{self.kind}/{self.name}: [{self.rule}] {self.message}"
+
+
+def _pod_spec(obj: dict[str, Any]) -> dict[str, Any]:
+    return obj.get("spec", {}).get("template", {}).get("spec", {}) or {}
+
+
+def check(manifests: list[dict[str, Any]], namespace: str, domain: str) -> list[Violation]:
+    out: list[Violation] = []
+
+    def add(obj: dict[str, Any], rule: str, message: str) -> None:
+        meta = obj.get("metadata", {}) or {}
+        out.append(Violation(str(obj.get("kind", "?")), str(meta.get("name", "?")), rule, message))
+
+    kinds = [m.get("kind") for m in manifests]
+    for obj in manifests:
+        kind = obj.get("kind")
+        meta = obj.get("metadata", {}) or {}
+        if kind not in ALLOWED_KINDS:
+            add(obj, "allowed-kinds", f"kind {kind!r} is not allowed in a preview environment")
+            continue
+        if kind == "Namespace":
+            if meta.get("name") != namespace:
+                add(obj, "single-namespace", f"creates namespace {meta.get('name')!r}, expected {namespace!r}")
+            continue
+        if meta.get("namespace") != namespace:
+            add(obj, "single-namespace", f"targets namespace {meta.get('namespace')!r}, expected {namespace!r}")
+        if kind == "Service" and obj.get("spec", {}).get("type", "ClusterIP") != "ClusterIP":
+            add(obj, "cluster-ip-only", "previews are exposed through the Ingress, not LoadBalancer/NodePort")
+        if kind == "Ingress":
+            for rule in obj.get("spec", {}).get("rules", []):
+                host = rule.get("host", "")
+                if not host.endswith("." + domain):
+                    add(obj, "preview-domain", f"host {host!r} is outside the preview domain {domain!r}")
+        if kind in WORKLOAD_KINDS:
+            out.extend(_check_pod(obj, _pod_spec(obj)))
+
+    for required, rule in (("ResourceQuota", "quota-required"), ("NetworkPolicy", "network-policy-required")):
+        if required not in kinds:
+            out.append(Violation(required, "-", rule, f"every preview needs a {required}"))
+    return out
+
+
+def _check_pod(obj: dict[str, Any], spec: dict[str, Any]) -> list[Violation]:
+    meta = obj.get("metadata", {}) or {}
+    name = str(meta.get("name", "?"))
+    kind = str(obj.get("kind"))
+    out: list[Violation] = []
+
+    def add(rule: str, message: str) -> None:
+        out.append(Violation(kind, name, rule, message))
+
+    for flag in ("hostNetwork", "hostPID", "hostIPC"):
+        if spec.get(flag):
+            add("no-host-namespaces", f"{flag} is not allowed")
+    for vol in spec.get("volumes", []) or []:
+        if "hostPath" in vol:
+            add("no-host-path", f"volume {vol.get('name')!r} mounts a hostPath")
+    if spec.get("automountServiceAccountToken", True):
+        add("no-sa-token", "set automountServiceAccountToken: false; previews do not call the API server")
+    pod_sc = spec.get("securityContext", {}) or {}
+    containers = (spec.get("containers") or []) + (spec.get("initContainers") or [])
+    if not containers:
+        add("containers", "workload has no containers")
+    for c in containers:
+        cname = c.get("name", "?")
+        image = str(c.get("image", ""))
+        last = image.rsplit("/", 1)[-1]
+        if "@sha256:" not in image and (":" not in last or last.endswith(":latest")):
+            add("pinned-image", f"container {cname!r} image {image!r} must be pinned to a tag or digest, not latest")
+        limits = (c.get("resources") or {}).get("limits") or {}
+        if "cpu" not in limits or "memory" not in limits:
+            add("resource-limits", f"container {cname!r} must set cpu and memory limits")
+        sc = c.get("securityContext", {}) or {}
+        if sc.get("privileged"):
+            add("no-privileged", f"container {cname!r} is privileged")
+        if sc.get("allowPrivilegeEscalation", True):
+            add("no-privilege-escalation", f"container {cname!r} must set allowPrivilegeEscalation: false")
+        if not (sc.get("runAsNonRoot") or pod_sc.get("runAsNonRoot")):
+            add("non-root", f"container {cname!r} must run as non-root")
+        if "ALL" not in ((sc.get("capabilities") or {}).get("drop") or []):
+            add("drop-capabilities", f"container {cname!r} must drop ALL capabilities")
+    return out
