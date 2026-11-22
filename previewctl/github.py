@@ -16,14 +16,16 @@ _NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 Opener = Callable[..., Any]
 
 
-def open_pull_requests(repo: str, token: str | None = None, *, opener: Opener = urllib.request.urlopen) -> set[int]:
+def open_pull_requests(
+    repo: str, token: str | None = None, *, opener: Opener = urllib.request.urlopen, max_pages: int = 50
+) -> set[int]:
     if not _REPO_RE.match(repo):
         raise ValueError(f"repository must look like owner/name, got {repo!r}")
     token = token if token is not None else os.environ.get("GITHUB_TOKEN")
     url: str | None = f"{API}/repos/{repo}/pulls?state=open&per_page=100"
     numbers: set[int] = set()
     pages = 0
-    while url and pages < 50:
+    while url and pages < max_pages:
         if not url.startswith(API + "/"):
             raise ValueError(f"refusing to follow pagination link outside the GitHub API: {url!r}")
         req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})  # noqa: S310
@@ -34,4 +36,7 @@ def open_pull_requests(repo: str, token: str | None = None, *, opener: Opener = 
             match = _NEXT_RE.search(resp.headers.get("Link", "") or "")
         url = match.group(1) if match else None
         pages += 1
+    if url:
+        # A partial list would make gc treat the missing PRs as closed and delete their previews.
+        raise ValueError(f"more than {pages * 100} open pull requests; refusing to return an incomplete list")
     return numbers

@@ -67,18 +67,17 @@ def plan(namespaces: list[dict[str, Any]], open_prs: set[int] | None, now: datet
             decisions.append(GcDecision(name, pr, "pinned", False))
         elif pr is None:
             decisions.append(GcDecision(name, pr, "missing-pr-label", False))
+        elif (expires := _expiry(meta)) is None:
+            # Metadata previewctl did not write (or someone edited): report, never delete.
+            decisions.append(GcDecision(name, pr, "missing-expiry", False))
         elif open_prs is not None and pr not in open_prs:
             decisions.append(GcDecision(name, pr, "pr-closed", True))
         elif name in superseded:
             decisions.append(GcDecision(name, pr, "superseded", True))
+        elif expires <= now:
+            decisions.append(GcDecision(name, pr, "expired", True))
         else:
-            expires = _expiry(meta)
-            if expires is None:
-                decisions.append(GcDecision(name, pr, "missing-expiry", False))
-            elif expires <= now:
-                decisions.append(GcDecision(name, pr, "expired", True))
-            else:
-                decisions.append(GcDecision(name, pr, "active", False))
+            decisions.append(GcDecision(name, pr, "active", False))
     return sorted(decisions, key=lambda d: d.namespace)
 
 

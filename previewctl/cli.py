@@ -24,7 +24,7 @@ from .gc import plan
 from .github import open_pull_requests
 from .kube import Kubectl, KubectlError
 from .naming import env_name, host_for
-from .policy import check
+from .policy import check, check_extra
 from .render import PreviewTarget, render, to_yaml
 
 MANIFEST_FILE = "manifests.yaml"
@@ -79,12 +79,16 @@ def build_parser() -> argparse.ArgumentParser:
 def _render_checked(args: argparse.Namespace, cfg: PreviewConfig) -> tuple[PreviewTarget, list[dict], str]:
     target = PreviewTarget(pr=args.pr, sha=args.sha, branch=args.branch)
     manifests = render(cfg, target)
+    extras: list[dict] = []
     for extra in args.extra:
         docs = [d for d in yaml.safe_load_all(Path(extra).read_text(encoding="utf-8")) if d]
         for d in docs:
+            if not isinstance(d, dict):
+                raise ValueError(f"{extra}: every document must be a mapping")
             d.setdefault("metadata", {}).setdefault("namespace", target.namespace)
-        manifests += docs
-    violations = check(manifests, target.namespace, cfg.domain)
+        extras += docs
+    manifests += extras
+    violations = check(manifests, target.namespace, cfg.domain) + check_extra(extras)
     if violations:
         raise PolicyFailure(violations)
     return target, manifests, to_yaml(manifests)

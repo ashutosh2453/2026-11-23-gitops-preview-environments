@@ -135,3 +135,31 @@ def test_digest_pinned_images_are_accepted():
     assert "pinned-image" not in _rules(ms)
     c["image"] = "registry.local:5000/app"  # port colon is not a tag
     assert "pinned-image" in _rules(ms)
+
+
+def test_extra_manifests_cannot_replace_generated_guardrails():
+    from previewctl.policy import check_extra
+
+    extras = [
+        {"kind": "Namespace", "metadata": {"name": NS, "labels": {}}},
+        {"kind": "ResourceQuota", "metadata": {"name": "preview-quota", "namespace": NS}},
+        {"kind": "LimitRange", "metadata": {"name": "preview-defaults", "namespace": NS}},
+        {
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "allow-all", "namespace": NS},
+            "spec": {"podSelector": {}, "ingress": [{}]},
+        },
+        {"kind": "ConfigMap", "metadata": {"name": "fine", "namespace": NS}},
+    ]
+    found = check_extra(extras)
+    assert [v.kind for v in found] == ["Namespace", "ResourceQuota", "LimitRange", "NetworkPolicy"]
+    assert {v.rule for v in found} == {"reserved-kind"}
+
+
+def test_ingress_default_backend_and_hostless_rules_are_rejected():
+    ms = copy.deepcopy(render(CFG, TARGET, NOW))
+    ing = by_kind(ms, "Ingress")[0]
+    ing["spec"] = {"defaultBackend": {"service": {"name": "web", "port": {"number": 80}}}}
+    assert {"no-default-backend", "preview-domain"} <= _rules(ms)
+    ing["spec"] = {"rules": [{"http": {"paths": []}}]}
+    assert "preview-domain" in _rules(ms)

@@ -100,3 +100,22 @@ def test_renamed_branch_keeps_only_newest_namespace():
 def test_closed_wins_over_superseded():
     out = reasons(plan([ns("pr-9-a", 9, created="1"), ns("pr-9-b", 9, created="2")], set(), NOW))
     assert out == {"pr-9-a": ("pr-closed", True), "pr-9-b": ("pr-closed", True)}
+
+
+def test_closed_or_superseded_with_bad_expiry_is_kept():
+    out = reasons(
+        plan(
+            [
+                ns("pr-1", 1, None),
+                ns("pr-2-a", 2, "garbage", created="1"),
+                ns("pr-2-b", 2, FUTURE, created="2"),
+            ],
+            {2},
+            NOW,
+        )
+    )
+    assert out == {
+        "pr-1": ("missing-expiry", False),
+        "pr-2-a": ("missing-expiry", False),
+        "pr-2-b": ("active", False),
+    }
