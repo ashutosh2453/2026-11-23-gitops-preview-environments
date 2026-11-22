@@ -1,0 +1,99 @@
+name: Preview environment
+
+# Builds the pull request, deploys it as a preview on a k3d cluster inside the
+# runner, smoke-tests it through the Ingress and posts a sticky status comment.
+#
+# The cluster lives only for the job, so the comment reports a *verified* preview
+# (deployed and smoke-tested), not a link you can open. To keep previews running,
+# point the deploy step at a persistent cluster and schedule `previewctl gc`.
+#
+# Security: the job that runs PR code has a read-only token and does not persist
+# it in git config. Only the separate `comment` job, which never checks out or runs
+# PR code, gets `pull-requests: write`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: Create cluster, build and import the image
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.8.3 bash
+          k3d cluster create preview --agents 0 -p "8081:80@loadbalancer" --wait --timeout 180s
+          docker build -q -t "preview-app:${SHA}" app
+          k3d image import -c preview "preview-app:${SHA}"
+          for _ in $(seq 1 60); do kubectl -n kube-system get deploy traefik >/dev/null 2>&1 && break; sleep 3; done
+          kubectl -n kube-system rollout status deploy/traefik --timeout=180s
+      - name: Deploy preview
+        run: previewctl deploy --pr "$PR" --branch "$BRANCH" --sha "$SHA" --config examples/preview.yaml
+      - name: Smoke test through the Ingress
+        id: smoke
+        run: |
+          NS=$(python -c "import os; from previewctl.naming import env_name; print(env_name(int(os.environ['PR']), os.environ['BRANCH']))")
+          for _ in $(seq 1 30); do
+            body=$(curl -fsS -m 5 -H "Host: ${NS}.preview.localtest.me" http://127.0.0.1:8081/version || true)
+            [ -n "$body" ] && break; sleep 2
+          done
+          echo "$body" | jq -e --arg sha "$SHA" '.sha == $sha'
+          { echo '```json'; echo "$body" | jq .; echo '```'; } > smoke.md
+      - name: Write status comment
+        if: always()
+        env:
+          STATUS: ${{ job.status == 'success' && 'verified' || 'failed' }}
+        run: |
+          details=$(cat smoke.md 2>/dev/null || true)
+          previewctl comment --pr "$PR" --branch "$BRANCH" --sha "$SHA" --config examples/preview.yaml \
+            --status "$STATUS" --details "$details" > comment.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preview-comment
+          path: comment.md
+          retention-days: 3
+
+  comment:
+    needs: preview
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-comment
+      - name: Create or update the sticky comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          head -1 comment.md | grep -qx '<!-- previewctl -->' || { echo "unexpected comment body"; exit 1; }
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- previewctl -->"))) | .id' | tail -1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F body=@comment.md >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -F body=@comment.md >/dev/null
+          fi

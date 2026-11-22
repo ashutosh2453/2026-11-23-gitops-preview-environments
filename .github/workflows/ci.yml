@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  K3D_VERSION: v5.8.3
+  KUBECONFORM_VERSION: v0.6.7
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,3 +28,58 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q
+
+  manifests:
+    name: kubeconform schema validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: Install kubeconform
+        run: |
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+      - name: Render and validate against the Kubernetes OpenAPI schemas
+        run: |
+          previewctl render --pr 42 --branch feature/login --sha "$GITHUB_SHA" --out rendered
+          previewctl render --pr 7 --sha "$GITHUB_SHA" --config examples/preview.yaml --out rendered
+          kubeconform -strict -summary -kubernetes-version 1.31.0 rendered/*/manifests.yaml
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - run: terraform fmt -check -recursive infra/terraform
+      - run: terraform -chdir=infra/terraform init -backend=false -input=false
+      - run: terraform -chdir=infra/terraform validate
+
+  e2e:
+    name: end-to-end on k3d
+    needs: [test, terraform]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: Install k3d
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="$K3D_VERSION" bash
+      - run: bash scripts/e2e.sh
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl get ns --show-labels || true
+          kubectl get all,netpol,ingress,quota -A || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
